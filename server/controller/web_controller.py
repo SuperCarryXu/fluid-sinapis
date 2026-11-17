@@ -27,12 +27,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.websockets import WebSocketClose
 
 from server.agent.adapters.kubernetes import KubernetesAdapter
 from server.agent.schemas import CollectorSnapshot, Metric, Target
@@ -402,13 +403,27 @@ def _friendly_error(exc: Exception) -> str:
 # FastAPI application
 # ==============================================================
 API_PREFIX = "/api"
-# Every method a client could send; the /api fallback answers all of them so an
-# unknown path is 404 (after auth), never a 405 that would bypass the 401.
-_ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
 
 def _is_api_path(path: str) -> bool:
     return path == API_PREFIX or path.startswith(API_PREFIX + "/")
+
+
+def _route_path(scope: Scope) -> str:
+    """The path the router matches against: ``scope["path"]`` minus ``root_path``
+    (set when the app is mounted under a prefix or served with --root-path)."""
+    path: str = scope["path"]
+    root_path: str = scope.get("root_path", "")
+    if root_path and path.startswith(root_path) and path[len(root_path):][:1] in ("", "/"):
+        return path[len(root_path):]
+    return path
+
+
+def _requires_api_key(scope: Scope) -> bool:
+    # Check both forms: depending on the server/mount, scope["path"] may or may not
+    # include root_path, and the router always strips it. Gating on either keeps
+    # every request the router would dispatch to an /api route behind the key.
+    return _is_api_path(scope["path"]) or _is_api_path(_route_path(scope))
 
 
 def _bearer_matches(authorization: str | None, expected: str) -> bool:
@@ -424,8 +439,9 @@ class ApiKeyMiddleware:
     """Require ``Authorization: Bearer <api_key>`` on every ``/api`` request.
 
     Enforced by path prefix at the ASGI layer rather than as route dependencies, so
-    every /api request is gated before routing: registered or not, any method, and
-    any route added later (hidden from the schema or not) cannot opt out by mistake.
+    every /api request is gated before routing: registered or not, any method, with
+    or without a mount prefix / root_path, and any route added later (hidden from the
+    schema or not) cannot opt out by mistake.
     The console shell (index.html, SPA deep links, /assets) stays public, because a
     browser navigation cannot attach a Bearer header — the page itself asks for the
     key and sends it on every API call.
@@ -441,7 +457,7 @@ class ApiKeyMiddleware:
         self.api_key = api_key
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and _is_api_path(scope["path"]):
+        if scope["type"] == "http" and _requires_api_key(scope):
             headers = dict(scope["headers"])
             authorization = headers.get(b"authorization", b"").decode("latin-1")
             if not _bearer_matches(authorization, self.api_key):
@@ -541,15 +557,6 @@ def create_app(
         return tracker.snapshot()
 
     _mount_user_system(app, settings, user_sink=user_sink, user_config_path=user_config_path)
-
-    # Unknown /api paths (any method, including bare /api) are 404 rather than
-    # falling through to the SPA catch-all or answering 405. Registered after every
-    # real API route; the middleware has already rejected unauthenticated callers.
-    @app.api_route(API_PREFIX, methods=_ALL_METHODS, include_in_schema=False)
-    @app.api_route(API_PREFIX + "/{rest:path}", methods=_ALL_METHODS, include_in_schema=False)
-    def unknown_api_route(rest: str = "") -> Any:
-        raise HTTPException(status_code=404, detail="unknown api route")
-
     _mount_frontend(app)
     return app
 
@@ -584,10 +591,7 @@ def _mount_frontend(app: FastAPI) -> None:
     if assets.is_dir():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
-    @app.get("/{full_path:path}", include_in_schema=False)
-    def spa(full_path: str) -> Any:
-        if full_path.startswith("api/"):
-            raise HTTPException(status_code=404, detail="unknown api route")
+    def spa_response(full_path: str) -> Response:
         candidate = (FRONTEND_DIST / full_path).resolve()
         if full_path and candidate.is_file() and FRONTEND_DIST.resolve() in candidate.parents:
             return FileResponse(candidate)
@@ -599,6 +603,30 @@ def _mount_frontend(app: FastAPI) -> None:
                 "detail": "frontend build not found; run: cd web && npm ci && npm run build"
             },
         )
+
+    async def unmatched(scope: Scope, receive: Receive, send: Send) -> None:
+        """Router default: runs only when no route matched (not a catch-all route),
+        so it can never shadow an API route, whenever that route was registered.
+        Unknown /api paths are 404 for every method (auth already passed in
+        ApiKeyMiddleware); anything else is the SPA, for GET/HEAD only."""
+        if scope["type"] != "http":
+            await WebSocketClose()(scope, receive, send)
+            return
+        path = _route_path(scope)
+        response: Response
+        if _is_api_path(path):
+            response = JSONResponse(status_code=404, content={"detail": "unknown api route"})
+        elif scope["method"] not in ("GET", "HEAD"):
+            response = JSONResponse(
+                status_code=405,
+                content={"detail": "Method Not Allowed"},
+                headers={"Allow": "GET, HEAD"},
+            )
+        else:
+            response = spa_response(path.lstrip("/"))
+        await response(scope, receive, send)
+
+    app.router.default = unmatched
 
 
 def main() -> None:

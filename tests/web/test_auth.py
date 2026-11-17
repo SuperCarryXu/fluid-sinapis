@@ -4,14 +4,15 @@ The console shell (index.html, SPA deep links, /assets) stays public: a browser
 navigation cannot attach a Bearer header, and the page itself prompts for the key.
 
 The key comes from the deployment environment (SINAPIS_API_KEY) and is enforced
-at WebSettings.from_env() with fail-closed semantics; create_app() turns on the
-global dependency whenever the key is non-empty. Tests build settings directly,
-so both halves are covered separately here.
+at WebSettings.from_env() with fail-closed semantics; create_app() installs the
+/api path-prefix middleware (ApiKeyMiddleware) whenever the key is non-empty. Tests
+build settings directly, so both halves are covered separately here.
 """
 
 from __future__ import annotations
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from server.controller import web_controller
@@ -134,7 +135,7 @@ def console_client(tmp_path, monkeypatch) -> TestClient:
 class TestAuthScope:
     def test_console_index_loads_without_a_key(self, console_client):
         """Regression: with SINAPIS_API_KEY set, a plain browser visit to / used to
-        hit the global auth gate (401) before the key prompt could ever render."""
+        hit the app-wide auth gate (401) before the key prompt could ever render."""
         response = console_client.get("/")
         assert response.status_code == 200
         assert "console" in response.text
@@ -159,20 +160,29 @@ class TestAuthScope:
             response = console_client.request(method, path)
             assert response.status_code == 401, (method, path)
 
-    def test_route_added_later_is_gated_even_if_hidden(self, console_client):
+    @pytest.mark.parametrize("method", ["GET", "POST"])
+    def test_route_added_later_is_gated_and_reachable(self, console_client, method):
         """Auth is enforced by path prefix, not per route: a route someone adds
-        later (here hidden from the schema) cannot opt out by mistake."""
+        after create_app() (here hidden from the schema) cannot opt out by mistake,
+        and nothing registered earlier shadows it once the key is supplied."""
         app = console_client.app
 
-        # POST, appended after every built-in route: nothing else on the app can
-        # claim this request, so only a prefix-level gate can stop it.
-        @app.post("/api/added-later", include_in_schema=False)
+        @app.api_route("/api/added-later", methods=[method], include_in_schema=False)
         def added_later() -> dict[str, str]:
-            return {"leak": "yes"}
+            return {"reached": "yes"}
 
-        assert console_client.post("/api/added-later").status_code == 401
+        assert console_client.request(method, "/api/added-later").status_code == 401
+        response = console_client.request(method, "/api/added-later", headers=bearer(KEY))
+        assert response.status_code == 200
+        assert response.json() == {"reached": "yes"}
 
-    @pytest.mark.parametrize("method", ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    @pytest.mark.parametrize(
+        "method",
+        ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS",
+         # Not enumerated anywhere in the app: unknown /api handling must not rely
+         # on a method list.
+         "TRACE", "PROPFIND", "BREW"],
+    )
     @pytest.mark.parametrize("path", ["/api", "/api/", "/api/does-not-exist", "/api/a/b"])
     def test_unknown_api_path_is_401_without_key_and_404_with_it(
         self, console_client, method, path
@@ -184,6 +194,11 @@ class TestAuthScope:
         assert response.status_code == 404
         if method != "HEAD":
             assert response.json()["detail"] == "unknown api route"
+
+    def test_non_get_on_console_paths_is_405(self, console_client):
+        response = console_client.post("/settings/page")
+        assert response.status_code == 405
+        assert response.headers["allow"] == "GET, HEAD"
 
     def test_cors_preflight_is_answered_without_a_key(self, console_client):
         """Browsers send preflights without credentials; CORS wraps the auth gate,
@@ -204,3 +219,42 @@ class TestAuthScope:
         denied = console_client.get("/api/overview", headers={"Origin": origin})
         assert denied.status_code == 401
         assert denied.headers["access-control-allow-origin"] == origin
+
+
+# -- auth under a mount prefix / root_path -------------------------------------
+class TestAuthUnderPrefix:
+    """The router strips root_path before matching; the gate must too, otherwise
+    /console/api/... would reach the API handlers without a key."""
+
+    PATHS = [
+        ("GET", "/api/healthz"),
+        ("GET", "/api/openapi.json"),
+        ("GET", "/api/user-system/metrics/schema"),
+        ("POST", "/api/user-system/metrics"),
+        ("POST", "/api/user-system/events"),
+        ("GET", "/api/does-not-exist"),
+        ("GET", "/api"),
+    ]
+
+    @pytest.fixture()
+    def mounted_client(self, console_client) -> TestClient:
+        parent = FastAPI()
+        parent.mount("/console", console_client.app)
+        return TestClient(parent)
+
+    @pytest.mark.parametrize("method,path", PATHS)
+    def test_mounted_api_requires_the_key(self, mounted_client, method, path):
+        assert mounted_client.request(method, "/console" + path).status_code == 401
+
+    def test_mounted_api_and_console_work_with_and_without_key(self, mounted_client):
+        assert mounted_client.get("/console/api/healthz", headers=bearer(KEY)).status_code == 200
+        assert mounted_client.get("/console/").status_code == 200
+        assert mounted_client.get("/console/assets/app.js").status_code == 200
+
+    @pytest.mark.parametrize("method,path", PATHS)
+    def test_root_path_api_requires_the_key(self, console_client, method, path):
+        """--root-path deployments (reverse proxy prefix): with root_path set the
+        request path may carry the prefix; either way the key is required."""
+        client = TestClient(console_client.app, root_path="/console")
+        assert client.request(method, path).status_code == 401
+        assert client.request(method, "/console" + path).status_code == 401

@@ -84,8 +84,8 @@ bin/start.sh          # 启动全部：collector → backend → frontend → ag
 ## 4. 验证
 
 ```bash
-curl http://127.0.0.1:8000/api/healthz          # Web 后端存活
-curl http://127.0.0.1:8000/api/overview         # 实时采集的指标总览
+curl -H "Authorization: Bearer $SINAPIS_API_KEY" http://127.0.0.1:8000/api/healthz    # Web 后端存活
+curl -H "Authorization: Bearer $SINAPIS_API_KEY" http://127.0.0.1:8000/api/overview   # 实时采集的指标总览
 tail -f logs/agent.log                          # agent 阶段日志（轮次/读指标/推理/复核/执行）
 ```
 

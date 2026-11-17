@@ -90,8 +90,8 @@ bin/start.sh          # start all: collector → backend → frontend → agent
 ## 4. Verify
 
 ```bash
-curl http://127.0.0.1:8000/api/healthz          # web backend alive
-curl http://127.0.0.1:8000/api/overview         # live-collected metric overview
+curl -H "Authorization: Bearer $SINAPIS_API_KEY" http://127.0.0.1:8000/api/healthz    # web backend alive
+curl -H "Authorization: Bearer $SINAPIS_API_KEY" http://127.0.0.1:8000/api/overview   # live-collected metric overview
 tail -f logs/agent.log                          # agent stage logs (rounds/metrics/planning/review/execution)
 ```
 
