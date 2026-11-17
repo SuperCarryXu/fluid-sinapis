@@ -52,7 +52,8 @@ export LLM_API_KEY=<your key>
 export SINAPIS_API_KEY=$(openssl rand -hex 32)   # generate ONCE, then persist (see below)
 ```
 
-> The API key protects every HTTP endpoint (`Authorization: Bearer`). Generate it
+> The API key protects every `/api` endpoint (`Authorization: Bearer`); the web console
+> page opens without it and prompts for the key. Generate it
 > once and persist it in your deployment environment (shell profile, systemd
 > `EnvironmentFile`, …) — it must stay the same across restarts and must never be
 > committed to git. Pushers and the web console send the same key; details in the
@@ -68,9 +69,9 @@ bin/start.sh          # start all: collector → backend → frontend → agent
 ```
 
 - PIDs go to `run/`, logs to `logs/`; `bin/stop.sh` stops, `bin/restart.sh` restarts;
-- The backend refuses to start without `SINAPIS_API_KEY` and every endpoint requires
-  `Authorization: Bearer <key>` (clearly opt out with `SINAPIS_AUTH_DISABLED=true`
-  for a keyless local run only);
+- The backend refuses to start without `SINAPIS_API_KEY` and every `/api` endpoint
+  requires `Authorization: Bearer <key>`; the console page itself loads without one
+  (clearly opt out with `SINAPIS_AUTH_DISABLED=true` for a keyless local run only);
 - The backend listens on `127.0.0.1:8000` and its API data **always comes from real
   cluster collection**. Keep `127.0.0.1` unless you deliberately expose it: the key
   travels over plain HTTP, so LAN/public exposure needs a TLS-terminating reverse

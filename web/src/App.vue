@@ -20,7 +20,7 @@ const loading = ref(false)
 const interval = ref(readStoredInterval())
 const firstLoad = computed(() => !data.value && loading.value)
 
-// API-key gate: the backend requires "Authorization: Bearer" on every endpoint.
+// API-key gate: the backend requires "Authorization: Bearer" on every /api request.
 // The key is entered once here and kept in this browser's localStorage; a 401
 // (missing or wrong key) reopens the gate.
 const needsKey = ref(false)

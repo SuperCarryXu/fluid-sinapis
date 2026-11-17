@@ -224,7 +224,7 @@ class WebSettings:
     # User-system external metrics: the push/storage channel and the metric definition file.
     user_pushgateway_url: str = "http://localhost:9091"
     user_metrics_config: str = ""
-    # API key required on every endpoint ("Authorization: Bearer <key>"). Empty only
+    # API key required on every /api request ("Authorization: Bearer <key>"). Empty only
     # ever happens for programmatically built settings (tests); the real entry point
     # from_env() refuses to produce settings without a key unless auth is explicitly
     # disabled, so no production path can end up serving an unauthenticated API.

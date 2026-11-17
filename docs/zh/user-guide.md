@@ -257,7 +257,7 @@ execution:
 | `COLLECTOR_INTERVAL_SECONDS` | `collectors.interval_seconds` | 10 |
 | `LLM_API_KEY` 等 | `model.api_key` 的 `${...}` 占位符 | 无（未设置启动报错） |
 | `WEB_HOST` / `WEB_PORT` | Web 监听地址 | 代码与 `bin/start.sh` 均默认 127.0.0.1 / 8000；仅在有意识的局域网暴露时才设 `WEB_HOST=0.0.0.0`——并配合 TLS 反向代理，见第 7 节的安全提示 |
-| `SINAPIS_API_KEY` / `SINAPIS_AUTH_DISABLED` | 所有 HTTP 接口的 API Key（`Authorization: Bearer`）/ 显式无 Key 逃生开关 | 未设置 → backend 拒绝启动；见 [API Key 鉴权](#api-key-鉴权) |
+| `SINAPIS_API_KEY` / `SINAPIS_AUTH_DISABLED` | 所有 `/api` 接口的 API Key（`Authorization: Bearer`）/ 显式无 Key 逃生开关 | 未设置 → backend 拒绝启动；见 [API Key 鉴权](#api-key-鉴权) |
 | `WEB_CACHE_TTL_SECONDS` / `WEB_CORS_ORIGINS` | Web 缓存与跨域 | 5 / localhost |
 | `WEB_CACHED_FILES_SCAN_PATH` / `WEB_CACHED_FILES_TTL_SECONDS` | 已缓存文件表的 Alluxio 扫描目录 / 扫描结果缓存时长 | /models / 30 秒 |
 | `SINAPIS_USER_METRICS_CONFIG` | Web 控制台外接指标/事件定义的独立配置文件 | 默认同 `SINAPIS_CONFIG` 指向的文件 |
@@ -267,16 +267,19 @@ execution:
 
 ## 7. 启动
 
-> **⚠ 安全提示——所有 HTTP 接口都需要 API Key。** 后端除只读指标 API 外，还挂载了可写的
-> 推送接口（`POST /api/user-system/metrics` 与 `POST /api/user-system/events`），全部接口
+> **⚠ 安全提示——所有 `/api` 接口都需要 API Key。** 后端除只读指标 API 外，还挂载了可写的
+> 推送接口（`POST /api/user-system/metrics` 与 `POST /api/user-system/events`），全部 `/api` 接口
 > 都要求 `Authorization: Bearer $SINAPIS_API_KEY`。Key 生成一次后长期使用，绝不提交 git；
 > 同时注意 Key 在纯 HTTP 下是明文传输的：请保持 `WEB_HOST` 为 `127.0.0.1`（代码与启动脚本
 > 的默认值），不要把端口直接暴露到公网；确需局域网访问时，先在前面加一层 TLS 反向代理。
 
 ### API Key 鉴权
 
-后端的每一个 HTTP 接口（GET、POST 一视同仁，包括 `/api/docs` 和 `/api/openapi.json`）
-都要求请求头 `Authorization: Bearer <key>`。
+后端 `/api` 下的每一个请求（任意 HTTP 方法，包括 `/api/user-system/*`、`/api/docs` 和
+`/api/openapi.json`，以及不存在的 `/api` 路径）都要求请求头 `Authorization: Bearer <key>`，
+否则返回 401。Web 控制台页面本身（首页、页面路由和 `/assets` 静态资源）不需要 Key——
+浏览器打开页面时无法携带该请求头，页面加载后会提示输入 Key。允许来源的 CORS 预检请求
+同样不需要 Key。
 
 - **生成一次**：`openssl rand -hex 32`。Key 是长期固定的共享密钥——外部用户系统可以推送
   数年不变；只有泄露才需要轮换（过渡期服务端可同时接受新旧两把 Key，做到无停机轮换）。
@@ -287,8 +290,8 @@ execution:
   报错（`bin/start.sh backend` 会在启动前就提示原因）。只有显式设置
   `SINAPIS_AUTH_DISABLED=true` 才能无 Key 运行，该开关与设置 Key 互斥。
 - **谁需要带 Key**：外部推送方（curl / 推送模拟器 / 你的业务系统）发送
-  `Authorization: Bearer` 请求头；Web 控制台在浏览器中输入一次 Key（存
-  `localStorage`）即可。
+  `Authorization: Bearer` 请求头；Web 控制台直接打开页面，在页面提示时输入一次 Key（存
+  `localStorage`，之后的 API 请求自动携带）即可。
 
 ### 方式一：一键脚本（推荐）
 启动前，先构建前端依赖：cd web && npm install && npm run build  

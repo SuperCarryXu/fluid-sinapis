@@ -256,7 +256,7 @@ Conventions and rules:
 | `COLLECTOR_INTERVAL_SECONDS` | `collectors.interval_seconds` | 10 |
 | `LLM_API_KEY` etc. | `${...}` placeholders in `model.api_key` | unset → startup error |
 | `WEB_HOST` / `WEB_PORT` | web listen address | 127.0.0.1 / 8000 everywhere (code and `bin/start.sh`); set `WEB_HOST=0.0.0.0` only for deliberate LAN exposure — pair it with a TLS-terminating reverse proxy, see the security note in section 7 |
-| `SINAPIS_API_KEY` / `SINAPIS_AUTH_DISABLED` | API key for every HTTP endpoint (`Authorization: Bearer`) / explicit keyless escape hatch | unset → backend refuses to start; see [API Key Authentication](#api-key-authentication) |
+| `SINAPIS_API_KEY` / `SINAPIS_AUTH_DISABLED` | API key for every `/api` endpoint (`Authorization: Bearer`) / explicit keyless escape hatch | unset → backend refuses to start; see [API Key Authentication](#api-key-authentication) |
 | `WEB_CACHE_TTL_SECONDS` / `WEB_CORS_ORIGINS` | web cache & CORS | 5 / localhost |
 | `WEB_CACHED_FILES_SCAN_PATH` / `WEB_CACHED_FILES_TTL_SECONDS` | Alluxio scan path / result cache time for the cached-files table | /models / 30 s |
 | `SINAPIS_USER_METRICS_CONFIG` | separate config file for the user-system metric/event definitions (web console) | defaults to the `SINAPIS_CONFIG` file |
@@ -266,7 +266,7 @@ Conventions and rules:
 
 ## 7. Starting the System
 
-> **⚠ Security note — every HTTP endpoint requires an API key.** The backend serves
+> **⚠ Security note — every `/api` endpoint requires an API key.** The backend serves
 > the read-only metric APIs *and* writable push endpoints (`POST /api/user-system/metrics`
 > and `POST /api/user-system/events`), and all of them are gated behind
 > `Authorization: Bearer $SINAPIS_API_KEY`. Generate the key once, keep it out of git,
@@ -277,8 +277,12 @@ Conventions and rules:
 
 ### API Key Authentication
 
-Every HTTP endpoint of the backend (GET and POST alike, including `/api/docs` and
-`/api/openapi.json`) requires `Authorization: Bearer <key>`.
+Every request under `/api` (any HTTP method, including `/api/user-system/*`,
+`/api/docs`, `/api/openapi.json` and unknown `/api` paths) requires
+`Authorization: Bearer <key>` and is rejected with 401 otherwise. The web console
+itself (the index page, page routes and `/assets`) loads without a key — a browser
+navigation cannot send that header — and the page prompts for the key once loaded.
+CORS preflight requests from allowed origins also need no key.
 
 - **Generate once**: `openssl rand -hex 32`. The key is a long-lived shared secret —
   external user systems push against it for years; rotation is only needed if it leaks
@@ -292,8 +296,8 @@ Every HTTP endpoint of the backend (GET and POST alike, including `/api/docs` an
   A deliberately keyless local run is possible only by setting
   `SINAPIS_AUTH_DISABLED=true`, which is mutually exclusive with the key.
 - **Who needs it**: external pushers (curl / the user-system simulator / your systems)
-  send the `Authorization: Bearer` header; the web console asks for the key once in
-  the browser and keeps it in `localStorage`.
+  send the `Authorization: Bearer` header; the web console opens without a key, asks for it once
+  in the browser and keeps it in `localStorage` for subsequent API calls.
 
 ### Option 1: one-shot scripts (recommended)
 

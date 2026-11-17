@@ -106,7 +106,7 @@ curl -X POST http://127.0.0.1:8000/api/user-system/metrics \
   }'
 ```
 
-- Every endpoint requires the API key (see the
+- Every `/api` endpoint requires the API key (see the
   [API key section](user-guide.md#api-key-authentication) in the user guide);
 - `source`: identity of the pushing system, used as the Prometheus grouping key;
 - `metrics[]`: `name` must be in the configured list; `value` must be a finite number;

@@ -78,7 +78,7 @@
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--url` | `http://127.0.0.1:8000` | Web 控制台地址 |
-| `--api-key` | 环境变量 `SINAPIS_API_KEY` | 后端所有接口要求的 API Key |
+| `--api-key` | 环境变量 `SINAPIS_API_KEY` | 后端所有 `/api` 接口要求的 API Key |
 | `--source` | `hdfs-simulator` | 推送方标识（作为推送指标标签；对事件仅作记录） |
 | `--scenario` | 无（必填） | `preload` 或 `expand` |
 
