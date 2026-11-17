@@ -144,9 +144,7 @@ class TestAuthScope:
         assert console_client.get("/assets/app.js").status_code == 200
         assert console_client.get("/favicon.svg").status_code == 200
 
-    def test_every_registered_api_route_still_requires_the_key(self, console_client):
-        """Guard against a future /api route being added outside the protected
-        routers: each one must answer 401 without a key."""
+    def test_every_documented_api_route_still_requires_the_key(self, console_client):
         schema = console_client.app.openapi()
         endpoints = [
             (method.upper(), path)
@@ -161,8 +159,48 @@ class TestAuthScope:
             response = console_client.request(method, path)
             assert response.status_code == 401, (method, path)
 
-    def test_unknown_api_path_is_401_without_key_and_404_with_it(self, console_client):
-        assert console_client.get("/api/does-not-exist").status_code == 401
-        response = console_client.get("/api/does-not-exist", headers=bearer(KEY))
+    def test_route_added_later_is_gated_even_if_hidden(self, console_client):
+        """Auth is enforced by path prefix, not per route: a route someone adds
+        later (here hidden from the schema) cannot opt out by mistake."""
+        app = console_client.app
+
+        # POST, appended after every built-in route: nothing else on the app can
+        # claim this request, so only a prefix-level gate can stop it.
+        @app.post("/api/added-later", include_in_schema=False)
+        def added_later() -> dict[str, str]:
+            return {"leak": "yes"}
+
+        assert console_client.post("/api/added-later").status_code == 401
+
+    @pytest.mark.parametrize("method", ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    @pytest.mark.parametrize("path", ["/api", "/api/", "/api/does-not-exist", "/api/a/b"])
+    def test_unknown_api_path_is_401_without_key_and_404_with_it(
+        self, console_client, method, path
+    ):
+        """Any method on any unknown /api path: 401 anonymously (never 405, and
+        never the SPA page), 404 once authenticated."""
+        assert console_client.request(method, path).status_code == 401
+        response = console_client.request(method, path, headers=bearer(KEY))
         assert response.status_code == 404
-        assert response.json()["detail"] == "unknown api route"
+        if method != "HEAD":
+            assert response.json()["detail"] == "unknown api route"
+
+    def test_cors_preflight_is_answered_without_a_key(self, console_client):
+        """Browsers send preflights without credentials; CORS wraps the auth gate,
+        so an allowed origin gets its preflight answered, and a 401 still carries
+        the CORS headers the page needs to read it."""
+        origin = "http://localhost:5173"
+        preflight = console_client.options(
+            "/api/overview",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Authorization",
+            },
+        )
+        assert preflight.status_code == 200
+        assert preflight.headers["access-control-allow-origin"] == origin
+
+        denied = console_client.get("/api/overview", headers={"Origin": origin})
+        assert denied.status_code == 401
+        assert denied.headers["access-control-allow-origin"] == origin

@@ -27,11 +27,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from server.agent.adapters.kubernetes import KubernetesAdapter
 from server.agent.schemas import CollectorSnapshot, Metric, Target
@@ -400,29 +401,58 @@ def _friendly_error(exc: Exception) -> str:
 # ==============================================================
 # FastAPI application
 # ==============================================================
-def _api_key_auth(api_key: str) -> Callable[[str | None], None]:
-    """Require ``Authorization: Bearer <api_key>`` on every request.
+API_PREFIX = "/api"
+# Every method a client could send; the /api fallback answers all of them so an
+# unknown path is 404 (after auth), never a 405 that would bypass the 401.
+_ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+
+def _is_api_path(path: str) -> bool:
+    return path == API_PREFIX or path.startswith(API_PREFIX + "/")
+
+
+def _bearer_matches(authorization: str | None, expected: str) -> bool:
+    scheme, _, credential = (authorization or "").partition(" ")
+    return (
+        scheme.strip().lower() == "bearer"
+        and bool(credential.strip())
+        and secrets.compare_digest(credential.strip().encode(), expected.encode())
+    )
+
+
+class ApiKeyMiddleware:
+    """Require ``Authorization: Bearer <api_key>`` on every ``/api`` request.
+
+    Enforced by path prefix at the ASGI layer rather than as route dependencies, so
+    every /api request is gated before routing: registered or not, any method, and
+    any route added later (hidden from the schema or not) cannot opt out by mistake.
+    The console shell (index.html, SPA deep links, /assets) stays public, because a
+    browser navigation cannot attach a Bearer header — the page itself asks for the
+    key and sends it on every API call.
 
     The comparison is constant-time so response latency cannot leak key bytes.
     Rejections are deliberately uniform (401, same message) whether the header is
     missing, malformed, or wrong, so a caller cannot probe which of the three it hit.
+    CORSMiddleware must wrap this one so allowed preflights are answered before auth.
     """
-    expected = api_key
 
-    def check(authorization: str | None = Header(default=None)) -> None:
-        scheme, _, credential = (authorization or "").partition(" ")
-        if (
-            scheme.strip().lower() != "bearer"
-            or not credential
-            or not secrets.compare_digest(credential.strip(), expected)
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="missing or invalid API key",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    def __init__(self, app: ASGIApp, *, api_key: str) -> None:
+        self.app = app
+        self.api_key = api_key
 
-    return check
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and _is_api_path(scope["path"]):
+            headers = dict(scope["headers"])
+            authorization = headers.get(b"authorization", b"").decode("latin-1")
+            if not _bearer_matches(authorization, self.api_key):
+                response = JSONResponse(
+                    status_code=401,
+                    content={"detail": "missing or invalid API key"},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 def create_app(
@@ -447,20 +477,18 @@ def create_app(
     app = FastAPI(
         title="Fluid-Sinapis-Agent Web API",
         version="0.1.0",
-        # Custom (gated) docs below instead of docs_url/openapi_url: FastAPI's
-        # built-in docs routes live at the Starlette layer, where global
-        # dependencies do NOT apply — they would bypass the API key.
+        # Custom docs under /api (gated by ApiKeyMiddleware) instead of the
+        # built-in /docs and /openapi.json, which sit outside the /api prefix.
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
     )
-    # Auth is scoped to /api/*: the console shell (index.html, /assets) must load
-    # anonymously, because a browser navigation cannot attach a Bearer header — the
-    # page itself asks for the key and sends it on every API call. Programmatic
-    # callers (tests) may build settings without a key; the real entry point
-    # WebSettings.from_env() never produces one.
-    auth = [Depends(_api_key_auth(settings.api_key))] if settings.api_key else []
-    api = APIRouter(prefix="/api", dependencies=auth)
+    # Auth gates the /api prefix only (see ApiKeyMiddleware). Programmatic callers
+    # (tests) may build settings without a key; the real entry point
+    # WebSettings.from_env() never produces one. Added before CORS so that CORS
+    # ends up outermost and answers allowed preflights without a key.
+    if settings.api_key:
+        app.add_middleware(ApiKeyMiddleware, api_key=settings.api_key)
     app.state.settings = settings
     app.state.service = service
     app.state.tracker = tracker
@@ -477,15 +505,15 @@ def create_app(
             allow_headers=["*", "Authorization"],
         )
 
-    @api.get("/healthz", tags=["system"])
+    @app.get("/api/healthz", tags=["system"])
     def healthz() -> dict[str, Any]:
         return {"status": "ok"}
 
-    @api.get("/openapi.json", include_in_schema=False)
+    @app.get("/api/openapi.json", include_in_schema=False)
     def openapi_schema() -> JSONResponse:
         return JSONResponse(app.openapi())
 
-    @api.get("/docs", include_in_schema=False)
+    @app.get("/api/docs", include_in_schema=False)
     def swagger_ui() -> Any:
         from fastapi.openapi.docs import get_swagger_ui_html
 
@@ -493,40 +521,35 @@ def create_app(
             openapi_url="/api/openapi.json", title=app.title
         )
 
-    @api.get("/overview", response_model=Overview, tags=["metrics"])
+    @app.get("/api/overview", response_model=Overview, tags=["metrics"])
     def overview() -> Overview:
         """Return both the Kubernetes and Fluid sections at once, so a page refresh
         costs a single request."""
         return service.overview()
 
-    @api.get("/k8s", response_model=SectionView, tags=["metrics"])
+    @app.get("/api/k8s", response_model=SectionView, tags=["metrics"])
     def k8s_section() -> SectionView:
         return service.section("k8s")
 
-    @api.get("/fluid", response_model=SectionView, tags=["metrics"])
+    @app.get("/api/fluid", response_model=SectionView, tags=["metrics"])
     def fluid_section() -> SectionView:
         return service.section("fluid")
 
-    @api.get("/cached-files", response_model=CachedFilesResponse, tags=["metrics"])
+    @app.get("/api/cached-files", response_model=CachedFilesResponse, tags=["metrics"])
     def cached_files() -> CachedFilesResponse:
         """Dataset files with any part cached in Alluxio (>0%), with entry times."""
         return tracker.snapshot()
 
-    app.include_router(api)
-    _mount_user_system(
-        app, settings, auth=auth, user_sink=user_sink, user_config_path=user_config_path
-    )
+    _mount_user_system(app, settings, user_sink=user_sink, user_config_path=user_config_path)
 
-    # Unknown /api/* paths answer 404 only to authenticated callers (401 otherwise),
-    # so the API surface cannot be probed anonymously. Registered after every real
-    # API route and before the SPA catch-all, which would otherwise claim them.
-    api_fallback = APIRouter(prefix="/api", dependencies=auth)
-
-    @api_fallback.get("/{rest:path}", include_in_schema=False)
-    def unknown_api_route(rest: str) -> Any:
+    # Unknown /api paths (any method, including bare /api) are 404 rather than
+    # falling through to the SPA catch-all or answering 405. Registered after every
+    # real API route; the middleware has already rejected unauthenticated callers.
+    @app.api_route(API_PREFIX, methods=_ALL_METHODS, include_in_schema=False)
+    @app.api_route(API_PREFIX + "/{rest:path}", methods=_ALL_METHODS, include_in_schema=False)
+    def unknown_api_route(rest: str = "") -> Any:
         raise HTTPException(status_code=404, detail="unknown api route")
 
-    app.include_router(api_fallback)
     _mount_frontend(app)
     return app
 
@@ -535,7 +558,6 @@ def _mount_user_system(
     app: FastAPI,
     settings: WebSettings,
     *,
-    auth: list[Any],
     user_sink: MetricsSink | None,
     user_config_path: str | Path | None,
 ) -> None:
@@ -551,7 +573,7 @@ def _mount_user_system(
         # Only the write channel is needed; building the full configure() pipeline
         # would also create a reader and snapshot store that nothing uses here.
         sink = PushgatewaySink(settings.user_pushgateway_url)
-    app.include_router(create_user_system_router(store=store, sink=sink), dependencies=auth)
+    app.include_router(create_user_system_router(store=store, sink=sink))
 
 
 def _mount_frontend(app: FastAPI) -> None:
