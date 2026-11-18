@@ -83,7 +83,7 @@ before starting.
 | Option | Default | Description |
 |---|---|---|
 | `--url` | `http://127.0.0.1:8000` | Web console address |
-| `--api-key` | env `SINAPIS_API_KEY` | API key the backend requires on every endpoint |
+| `--api-key` | env `SINAPIS_API_KEY` | API key the backend requires on every `/api` endpoint |
 | `--source` | `hdfs-simulator` | Pusher identity (labels pushed metrics; informational for events) |
 | `--scenario` | — (required) | `preload` or `expand` |
 

@@ -27,11 +27,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.websockets import WebSocketClose
 
 from server.agent.adapters.kubernetes import KubernetesAdapter
 from server.agent.schemas import CollectorSnapshot, Metric, Target
@@ -223,7 +225,7 @@ class WebSettings:
     # User-system external metrics: the push/storage channel and the metric definition file.
     user_pushgateway_url: str = "http://localhost:9091"
     user_metrics_config: str = ""
-    # API key required on every endpoint ("Authorization: Bearer <key>"). Empty only
+    # API key required on every /api request ("Authorization: Bearer <key>"). Empty only
     # ever happens for programmatically built settings (tests); the real entry point
     # from_env() refuses to produce settings without a key unless auth is explicitly
     # disabled, so no production path can end up serving an unauthenticated API.
@@ -400,29 +402,73 @@ def _friendly_error(exc: Exception) -> str:
 # ==============================================================
 # FastAPI application
 # ==============================================================
-def _api_key_auth(api_key: str) -> Callable[[str | None], None]:
-    """Require ``Authorization: Bearer <api_key>`` on every request.
+API_PREFIX = "/api"
+
+
+def _is_api_path(path: str) -> bool:
+    return path == API_PREFIX or path.startswith(API_PREFIX + "/")
+
+
+def _route_path(scope: Scope) -> str:
+    """The path the router matches against: ``scope["path"]`` minus ``root_path``
+    (set when the app is mounted under a prefix or served with --root-path)."""
+    path: str = scope["path"]
+    root_path: str = scope.get("root_path", "")
+    if root_path and path.startswith(root_path) and path[len(root_path):][:1] in ("", "/"):
+        return path[len(root_path):]
+    return path
+
+
+def _requires_api_key(scope: Scope) -> bool:
+    # Check both forms: depending on the server/mount, scope["path"] may or may not
+    # include root_path, and the router always strips it. Gating on either keeps
+    # every request the router would dispatch to an /api route behind the key.
+    return _is_api_path(scope["path"]) or _is_api_path(_route_path(scope))
+
+
+def _bearer_matches(authorization: str | None, expected: str) -> bool:
+    scheme, _, credential = (authorization or "").partition(" ")
+    return (
+        scheme.strip().lower() == "bearer"
+        and bool(credential.strip())
+        and secrets.compare_digest(credential.strip().encode(), expected.encode())
+    )
+
+
+class ApiKeyMiddleware:
+    """Require ``Authorization: Bearer <api_key>`` on every ``/api`` request.
+
+    Enforced by path prefix at the ASGI layer rather than as route dependencies, so
+    every /api request is gated before routing: registered or not, any method, with
+    or without a mount prefix / root_path, and any route added later (hidden from the
+    schema or not) cannot opt out by mistake.
+    The console shell (index.html, SPA deep links, /assets) stays public, because a
+    browser navigation cannot attach a Bearer header — the page itself asks for the
+    key and sends it on every API call.
 
     The comparison is constant-time so response latency cannot leak key bytes.
     Rejections are deliberately uniform (401, same message) whether the header is
     missing, malformed, or wrong, so a caller cannot probe which of the three it hit.
+    CORSMiddleware must wrap this one so allowed preflights are answered before auth.
     """
-    expected = api_key
 
-    def check(authorization: str | None = Header(default=None)) -> None:
-        scheme, _, credential = (authorization or "").partition(" ")
-        if (
-            scheme.strip().lower() != "bearer"
-            or not credential
-            or not secrets.compare_digest(credential.strip(), expected)
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="missing or invalid API key",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    def __init__(self, app: ASGIApp, *, api_key: str) -> None:
+        self.app = app
+        self.api_key = api_key
 
-    return check
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and _requires_api_key(scope):
+            headers = dict(scope["headers"])
+            authorization = headers.get(b"authorization", b"").decode("latin-1")
+            if not _bearer_matches(authorization, self.api_key):
+                response = JSONResponse(
+                    status_code=401,
+                    content={"detail": "missing or invalid API key"},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 def create_app(
@@ -447,17 +493,18 @@ def create_app(
     app = FastAPI(
         title="Fluid-Sinapis-Agent Web API",
         version="0.1.0",
-        # Custom (gated) docs below instead of docs_url/openapi_url: FastAPI's
-        # built-in docs routes live at the Starlette layer, where global
-        # dependencies do NOT apply — they would bypass the API key.
+        # Custom docs under /api (gated by ApiKeyMiddleware) instead of the
+        # built-in /docs and /openapi.json, which sit outside the /api prefix.
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
-        # Global auth: every route (GET and POST alike) requires the key.
-        # Programmatic callers (tests) may build settings without a key; the real
-        # entry point WebSettings.from_env() never produces one.
-        dependencies=[Depends(_api_key_auth(settings.api_key))] if settings.api_key else [],
     )
+    # Auth gates the /api prefix only (see ApiKeyMiddleware). Programmatic callers
+    # (tests) may build settings without a key; the real entry point
+    # WebSettings.from_env() never produces one. Added before CORS so that CORS
+    # ends up outermost and answers allowed preflights without a key.
+    if settings.api_key:
+        app.add_middleware(ApiKeyMiddleware, api_key=settings.api_key)
     app.state.settings = settings
     app.state.service = service
     app.state.tracker = tracker
@@ -544,10 +591,7 @@ def _mount_frontend(app: FastAPI) -> None:
     if assets.is_dir():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
-    @app.get("/{full_path:path}", include_in_schema=False)
-    def spa(full_path: str) -> Any:
-        if full_path.startswith("api/"):
-            raise HTTPException(status_code=404, detail="unknown api route")
+    def spa_response(full_path: str) -> Response:
         candidate = (FRONTEND_DIST / full_path).resolve()
         if full_path and candidate.is_file() and FRONTEND_DIST.resolve() in candidate.parents:
             return FileResponse(candidate)
@@ -559,6 +603,30 @@ def _mount_frontend(app: FastAPI) -> None:
                 "detail": "frontend build not found; run: cd web && npm ci && npm run build"
             },
         )
+
+    async def unmatched(scope: Scope, receive: Receive, send: Send) -> None:
+        """Router default: runs only when no route matched (not a catch-all route),
+        so it can never shadow an API route, whenever that route was registered.
+        Unknown /api paths are 404 for every method (auth already passed in
+        ApiKeyMiddleware); anything else is the SPA, for GET/HEAD only."""
+        if scope["type"] != "http":
+            await WebSocketClose()(scope, receive, send)
+            return
+        path = _route_path(scope)
+        response: Response
+        if _is_api_path(path):
+            response = JSONResponse(status_code=404, content={"detail": "unknown api route"})
+        elif scope["method"] not in ("GET", "HEAD"):
+            response = JSONResponse(
+                status_code=405,
+                content={"detail": "Method Not Allowed"},
+                headers={"Allow": "GET, HEAD"},
+            )
+        else:
+            response = spa_response(path.lstrip("/"))
+        await response(scope, receive, send)
+
+    app.router.default = unmatched
 
 
 def main() -> None:

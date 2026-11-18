@@ -100,7 +100,7 @@ curl -X POST http://127.0.0.1:8000/api/user-system/metrics \
   }'
 ```
 
-- 所有接口都需要 API Key（见用户指南的 [API Key 鉴权](user-guide.md#api-key-鉴权) 一节）；
+- 所有 `/api` 接口都需要 API Key（见用户指南的 [API Key 鉴权](user-guide.md#api-key-鉴权) 一节）；
 - `source`：推送方标识，作为 Prometheus 分组键；
 - `metrics[]`：`name` 必须在配置清单内；`value` 必须是有限数值；配置里声明了 `labels`
   的指标必须携带对应 label 键（未声明的额外键也会保留）。
